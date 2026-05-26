@@ -3,6 +3,7 @@ import { config, assertOpenAI } from "../../config/env.js";
 
 let _client = null;
 
+/** Reuse one OpenAI client across agent calls in the same server process. */
 export function getOpenAIClient() {
   assertOpenAI();
   if (!_client) _client = new OpenAI({ apiKey: config.openai.apiKey });
@@ -32,6 +33,7 @@ export class AgentBase {
   }
 
   async run(context) {
+    // Base agents are JSON-only: scheduling code can consume structured output safely.
     const completion = await this.client.chat.completions.create({
       model: this.model,
       messages: [
@@ -47,6 +49,7 @@ export class AgentBase {
     try {
       return JSON.parse(raw);
     } catch (err) {
+      // Include raw model output so prompt/formatting failures are debuggable.
       throw new Error(`[${this.name}] Failed to parse JSON: ${err.message}\nRaw: ${raw}`);
     }
   }

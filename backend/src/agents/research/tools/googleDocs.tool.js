@@ -9,6 +9,7 @@ import { getAuthenticatedClient } from "../../../services/gcal.service.js";
  */
 export const googleDocsTool = tool(
   async ({ query, maxDocs = 3 }) => {
+    // Personal RAG source: searches the user's own docs for existing plans/lists/context.
     const auth = getAuthenticatedClient();
     if (!auth) {
       return JSON.stringify({ error: "NEEDS_RECONNECT", message: "Not authenticated with Google. The user needs to Connect Google Calendar in the app." });
@@ -74,6 +75,7 @@ export const googleDocsTool = tool(
 );
 
 function extractDocText(doc) {
+  // Google Docs API returns a structural tree; flatten paragraphs and tables into text.
   const content = doc.body?.content || [];
   const parts = [];
   for (const element of content) {

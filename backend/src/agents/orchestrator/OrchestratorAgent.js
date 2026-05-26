@@ -4,6 +4,7 @@ import { runGoalAgent } from "../goal/GoalAgent.js";
 import { Goal } from "../../models/Goal.js";
 import { Todo } from "../../models/Todo.js";
 
+/** The Orchestrator combines all goals, todos, and calendar gaps into one day plan. */
 export class OrchestratorAgent extends AgentBase {
   constructor() {
     super({
@@ -53,6 +54,7 @@ export async function orchestrateDay({
   freeSlots,
   extraDumpTodos = [],
 }) {
+  // Fetch independent inputs in parallel: active goals and pending brain-dump todos.
   const [activeGoals, pendingDump] = await Promise.all([
     Goal.find({ status: "active", "agentConfig.enabled": true }),
     Todo.find({ type: "dump", completed: false }),
@@ -60,6 +62,7 @@ export async function orchestrateDay({
 
   const today = new Date();
 
+  // Run one specialist GoalAgent per active goal. One failed goal should not fail the day.
   const proposals = await Promise.all(
     activeGoals.map((g) =>
       runGoalAgent(g, { today }).catch((err) => ({
@@ -77,12 +80,14 @@ export async function orchestrateDay({
 
   const totalFreeMinutes = freeSlots.reduce((s, x) => s + x.duration, 0);
 
+  // Dump todos are mandatory; goal proposals are optional candidates for free time.
   const dumpTodosForPrompt = [
     ...pendingDump.map((t) => ({ title: t.title })),
     ...extraDumpTodos,
   ];
 
   const agent = new OrchestratorAgent();
+  // The LLM receives all context at once and returns a structured schedule JSON.
   const result = await agent.run({
     calendarEvents,
     freeSlots,

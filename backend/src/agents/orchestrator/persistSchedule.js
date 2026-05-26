@@ -14,6 +14,7 @@ import { Todo } from "../../models/Todo.js";
 export async function persistAndEnrichSchedule(schedule) {
   if (!Array.isArray(schedule) || schedule.length === 0) return [];
 
+  // Build lookup tables so model text can be connected back to real DB documents.
   const activeGoals = await Goal.find({ status: "active" }).select("_id title");
   const goalsByTitle = new Map();
   for (const g of activeGoals) goalsByTitle.set(g.title.toLowerCase().trim(), g);
@@ -31,9 +32,11 @@ export async function persistAndEnrichSchedule(schedule) {
     let todoId = null;
 
     if (type === "dump") {
+      // Existing dump todos are linked, not recreated.
       const match = dumpByTitle.get((slot.task || "").toLowerCase().trim());
       if (match) todoId = match._id;
     } else if (type === "suggested") {
+      // Suggested slots become new todos so completing them updates goal progress later.
       const goalKey = (slot.goalTitle || "").toLowerCase().trim();
       const goal = goalKey ? goalsByTitle.get(goalKey) : null;
 

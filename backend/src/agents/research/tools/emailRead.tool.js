@@ -9,6 +9,7 @@ import { getAuthenticatedClient } from "../../../services/gcal.service.js";
  */
 export const emailReadTool = tool(
   async ({ query, max = 5 }) => {
+    // Personal context source: finds contacts, invitations, deadlines, and past commitments.
     const auth = getAuthenticatedClient();
     if (!auth) {
       return JSON.stringify({ error: "NEEDS_RECONNECT", message: "Not authenticated with Google. The user needs to Connect Google in the app.", results: [] });
@@ -36,6 +37,7 @@ export const emailReadTool = tool(
     const results = [];
     for (const msg of messages) {
       try {
+        // Metadata mode is fast and avoids pulling full email bodies into the trace.
         const detail = await gmail.users.messages.get({
           userId: "me",
           id: msg.id,

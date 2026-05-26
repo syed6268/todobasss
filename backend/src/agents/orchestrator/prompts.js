@@ -21,6 +21,7 @@ Your job:
 
 Always return ONLY valid JSON.`;
 
+/** Serialize calendar gaps, dump todos, goal proposals, and recent load into one scheduling prompt. */
 export function orchestratorUserPrompt({
   calendarEvents,
   freeSlots,
@@ -58,6 +59,7 @@ export function orchestratorUserPrompt({
       .map(([k, v]) => `  ${k}: ${v} tasks in last 3 days`)
       .join("\n") || "  (no history yet)";
 
+  // The returned JSON becomes the schedule shown on the calendar page.
   return `EXISTING CALENDAR EVENTS (keep exactly, type "calendar"):
 ${calendarStr}
 

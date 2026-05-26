@@ -16,6 +16,7 @@ You always respect:
 
 You always return ONLY valid JSON.`;
 
+/** Build the user prompt with the goal's current progress/memory. */
 export function goalAgentUserPrompt({ goal, today, recentCompletions, recentNotes }) {
   const daysSince = goal.daysSinceLastActivity;
   const targetStr = goal.targetDate
@@ -40,6 +41,7 @@ export function goalAgentUserPrompt({ goal, today, recentCompletions, recentNote
         .join("\n")
     : "(none)";
 
+  // The strict schema keeps the base AgentBase JSON parser reliable.
   return `Goal: ${goal.title}
 Description: ${goal.description || "(none)"}
 Category: ${goal.category || "(none)"}

@@ -10,12 +10,14 @@ import { config } from "../../../config/env.js";
  */
 export const emailWriteTool = tool(
   async ({ to, subject, body, sendNow = false }) => {
+    // Action tool: creates outreach drafts from research evidence.
     const auth = getAuthenticatedClient();
     if (!auth) {
       return JSON.stringify({ error: "NEEDS_RECONNECT", message: "Not authenticated with Google. The user needs to Connect Google in the app." });
     }
 
     const gmail = google.gmail({ version: "v1", auth });
+    // Safety switch: the model can request sendNow, but env config must also allow sending.
     const shouldSend = sendNow && config.research.emailWriterMode === "send";
     const rawMessage = buildRawEmail({ to, subject, body });
 
@@ -60,6 +62,7 @@ export const emailWriteTool = tool(
 );
 
 function buildRawEmail({ to, subject, body }) {
+  // Gmail API expects RFC 2822 email content encoded as base64url.
   const lines = [
     `To: ${to}`,
     `Subject: ${subject}`,

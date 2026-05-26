@@ -8,6 +8,7 @@ import { config } from "../../../config/env.js";
  */
 export const webSearchTool = tool(
   async ({ query, maxResults = 5 }) => {
+    // External discovery source: useful for current information before browser verification.
     if (!config.tavily.apiKey) {
       throw new Error("TAVILY_API_KEY not configured. See backend/.env.research.example");
     }
@@ -35,6 +36,7 @@ export const webSearchTool = tool(
     }
 
     const data = await response.json();
+    // Return compact search results so the planner can choose a source to verify.
     const results = (data.results || []).map((r) => ({
       title: r.title,
       url: r.url,

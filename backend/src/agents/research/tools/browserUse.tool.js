@@ -21,6 +21,7 @@ async function pollSessionWithStream(sessionId, onEvent, timeoutMs = 180_000) {
 
     // Stream intermediate agent messages (best-effort — don't abort on failure)
     try {
+      // Stream browser progress into the research trace while the remote session runs.
       const msgUrl = new URL(`${BASE_URL()}/sessions/${sessionId}/messages`);
       if (lastMessageId) msgUrl.searchParams.set("after", lastMessageId);
       msgUrl.searchParams.set("limit", "20");
@@ -72,6 +73,7 @@ async function pollSessionWithStream(sessionId, onEvent, timeoutMs = 180_000) {
 export function createBrowserUseTool(onEvent) {
   return tool(
     async ({ task, url }) => {
+      // Browser verification source: checks live pages and can expose a live iframe URL.
       if (!config.browserUse.apiUrl || !config.browserUse.apiKey) {
         return JSON.stringify({
           error: "BROWSER_USE_NOT_CONFIGURED",
