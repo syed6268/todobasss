@@ -35,6 +35,7 @@ router.post("/start", async (req, res) => {
     status: "running",
     events: [],
     proposals: [],
+    summary: "",
   });
 
   // Fire agent in background — do NOT await
@@ -198,11 +199,16 @@ function cleanupEmitter(runId) {
 async function runAgentBackground(runId, goal) {
   const emitter = getRunEmitter(String(runId));
 
+  // These event types are high-frequency streaming events — broadcast but don't
+  // store in MongoDB (they'd bloat the events array and aren't needed for replay).
+  const NON_PERSISTED = new Set(["browser_step", "browser_live_url"]);
+
   const onEvent = async (type, data) => {
-    // Persist to DB
-    await ResearchRun.findByIdAndUpdate(runId, {
-      $push: { events: { type, data, ts: new Date() } },
-    });
+    if (!NON_PERSISTED.has(type)) {
+      await ResearchRun.findByIdAndUpdate(runId, {
+        $push: { events: { type, data, ts: new Date() } },
+      });
+    }
     // Broadcast to any connected SSE clients
     emitter.emit("event", type, data);
   };
@@ -214,6 +220,7 @@ async function runAgentBackground(runId, goal) {
     await ResearchRun.findByIdAndUpdate(runId, {
       status: "awaiting_approval",
       proposals,
+      summary,
     });
 
     await onEvent("proposals", { proposals, summary });

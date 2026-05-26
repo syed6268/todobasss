@@ -38,6 +38,7 @@ const researchRunSchema = new Schema(
     },
     events: [eventSchema],
     proposals: [proposalSchema],
+    summary: { type: String, default: "" },
     createdTodoIds: [{ type: Schema.Types.ObjectId, ref: "Todo" }],
   },
   { timestamps: true }

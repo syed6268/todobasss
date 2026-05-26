@@ -56,8 +56,68 @@ function AlertIcon() {
     </svg>
   )
 }
+function GlobeIcon() {
+  return (
+    <svg className="h-3 w-3 shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="10"/>
+      <line x1="2" y1="12" x2="22" y2="12"/>
+      <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+    </svg>
+  )
+}
+function MonitorIcon() {
+  return (
+    <svg className="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+      <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
+    </svg>
+  )
+}
+
+// ── Live browser panel (collapsible iframe) ───────────────────────────────────
+function LiveBrowserPanel({ url }) {
+  const [open, setOpen] = useState(true)
+  return (
+    <div className="my-2 rounded-xl border border-sky-200 bg-sky-50 overflow-hidden">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-2 px-3 py-2 text-left"
+      >
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-sky-200 text-sky-700">
+          <MonitorIcon />
+        </span>
+        <span className="text-[11px] font-bold uppercase tracking-wider text-sky-700 flex-1">
+          Live Browser
+        </span>
+        <span className="text-[10px] text-sky-500">{open ? 'Hide' : 'Show'}</span>
+      </button>
+      {open && (
+        <div className="border-t border-sky-200">
+          <iframe
+            src={url}
+            title="Live Browser Session"
+            allow="autoplay"
+            style={{ width: '100%', aspectRatio: '16/9', border: 'none', display: 'block' }}
+          />
+        </div>
+      )}
+    </div>
+  )
+}
 
 // ── Trace event row ───────────────────────────────────────────────────────────
+function formatJson(value) {
+  if (value == null) return ''
+  if (typeof value === 'string') return value
+  return JSON.stringify(value, null, 2)
+}
+
+function summarizeArgs(args) {
+  if (!args || Object.keys(args).length === 0) return 'No parameters'
+  return Object.entries(args)
+    .map(([key, value]) => `${key}: ${String(value).slice(0, 80)}`)
+    .join(' · ')
+}
+
 function TraceEvent({ evt, index }) {
   const [open, setOpen] = useState(false)
 
@@ -73,6 +133,7 @@ function TraceEvent({ evt, index }) {
   }
 
   if (evt.type === 'tool_call') {
+    const args = evt.data.args || {}
     return (
       <div className="flex gap-2.5 py-2">
         <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-600">
@@ -82,17 +143,18 @@ function TraceEvent({ evt, index }) {
           <p className="text-[11px] font-bold uppercase tracking-wider text-amber-700">
             Tool call — {evt.data.tool}
           </p>
-          {evt.data.args && Object.keys(evt.data.args).length > 0 && (
+          <p className="mt-0.5 truncate text-[11px] text-slate-500">{summarizeArgs(args)}</p>
+          {Object.keys(args).length > 0 && (
             <button
               onClick={() => setOpen((o) => !o)}
               className="mt-1 text-[11px] text-slate-500 underline-offset-2 hover:underline"
             >
-              {open ? 'Hide args' : 'Show args'}
+              {open ? 'Hide parameters' : 'Show parameters'}
             </button>
           )}
           {open && (
             <pre className="mt-2 overflow-x-auto rounded-lg bg-slate-50 p-2 text-[11px] text-slate-700 border border-slate-200">
-              {JSON.stringify(evt.data.args, null, 2)}
+              {formatJson(args)}
             </pre>
           )}
         </div>
@@ -103,6 +165,7 @@ function TraceEvent({ evt, index }) {
   if (evt.type === 'tool_result') {
     const output = evt.data.output
     const screenshots = output?.screenshots || output?.screenshot_urls || []
+    const summary = evt.data.summary || 'Tool returned a response.'
     return (
       <div className="flex gap-2.5 py-2">
         <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-600">
@@ -112,11 +175,12 @@ function TraceEvent({ evt, index }) {
           <p className="text-[11px] font-bold uppercase tracking-wider text-emerald-700">
             Result — {evt.data.tool}
           </p>
+          <p className="mt-0.5 text-[11px] leading-relaxed text-slate-600">{summary}</p>
           <button
             onClick={() => setOpen((o) => !o)}
             className="mt-1 text-[11px] text-slate-500 underline-offset-2 hover:underline"
           >
-            {open ? 'Hide result' : 'Show result'}
+            {open ? 'Hide response' : 'Show response'}
           </button>
           {open && (
             <div className="mt-2 space-y-2">
@@ -134,12 +198,27 @@ function TraceEvent({ evt, index }) {
                 </div>
               )}
               <pre className="overflow-x-auto rounded-lg bg-slate-50 p-2 text-[11px] text-slate-700 border border-slate-200">
-                {typeof output === 'string' ? output : JSON.stringify(output, null, 2)}
+                {formatJson(output)}
               </pre>
             </div>
           )}
         </div>
       </div>
+    )
+  }
+
+  if (evt.type === 'browser_step') {
+    return (
+      <div className="ml-7 flex items-start gap-1.5 border-l-2 border-sky-200 py-1 pl-3">
+        <span className="mt-0.5 text-sky-400"><GlobeIcon /></span>
+        <p className="text-[11px] leading-relaxed text-slate-500">{evt.data.text}</p>
+      </div>
+    )
+  }
+
+  if (evt.type === 'browser_live_url') {
+    return (
+      <LiveBrowserPanel url={evt.data.url} />
     )
   }
 
@@ -284,6 +363,8 @@ export default function Research() {
     es.addEventListener('thought', (e) => { pushEvent('thought', JSON.parse(e.data)) })
     es.addEventListener('tool_call', (e) => { pushEvent('tool_call', JSON.parse(e.data)) })
     es.addEventListener('tool_result', (e) => { pushEvent('tool_result', JSON.parse(e.data)) })
+    es.addEventListener('browser_step', (e) => { pushEvent('browser_step', JSON.parse(e.data)) })
+    es.addEventListener('browser_live_url', (e) => { pushEvent('browser_live_url', JSON.parse(e.data)) })
     es.addEventListener('needs_reconnect', (e) => { pushEvent('needs_reconnect', JSON.parse(e.data)) })
     es.addEventListener('error', (e) => {
       try { pushEvent('error', JSON.parse(e.data)) } catch { /* SSE connection error */ }

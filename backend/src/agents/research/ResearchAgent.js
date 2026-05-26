@@ -1,7 +1,5 @@
 import { ChatOpenAI } from "@langchain/openai";
-import { HumanMessage, SystemMessage, AIMessage, ToolMessage } from "@langchain/core/messages";
-import { StateGraph, MessagesAnnotation, MemorySaver, START, END } from "@langchain/langgraph";
-import { ToolNode } from "@langchain/langgraph/prebuilt";
+import { HumanMessage, SystemMessage, ToolMessage } from "@langchain/core/messages";
 
 import { config } from "../../config/env.js";
 import { RESEARCH_SYSTEM, researchUserPrompt } from "./prompts.js";
@@ -9,162 +7,163 @@ import { googleDocsTool } from "./tools/googleDocs.tool.js";
 import { emailReadTool } from "./tools/emailRead.tool.js";
 import { emailWriteTool } from "./tools/emailWrite.tool.js";
 import { webSearchTool } from "./tools/webSearch.tool.js";
-import { browserUseTool } from "./tools/browserUse.tool.js";
+import { createBrowserUseTool } from "./tools/browserUse.tool.js";
 
-const TOOLS = [googleDocsTool, emailReadTool, emailWriteTool, webSearchTool, browserUseTool];
-
-// Required tools the model must call at least once before it can finish
+// REQUIRED_TOOL_NAMES used for planner reminders.
+// Only webSearch is a hard requirement — others are gracefully degraded.
 const REQUIRED_TOOL_NAMES = ["googleDocs", "emailRead", "webSearch", "browserUse"];
+const HARD_REQUIRED_TOOL_NAMES = ["webSearch"];
+const MAX_PLANNER_STEPS = 10;
 
-/**
- * Count how many distinct tool names from the required set have been called
- * at least once in the current message history.
- */
-function countCalledRequiredTools(messages) {
-  const called = new Set();
-  for (const m of messages) {
-    if (m instanceof AIMessage && m.tool_calls) {
-      for (const tc of m.tool_calls) {
-        if (REQUIRED_TOOL_NAMES.includes(tc.name)) called.add(tc.name);
-      }
-    }
-  }
-  return called.size;
+/** Build the tool list per-run so browserUse gets the live onEvent callback. */
+function buildTools(onEvent) {
+  return [
+    googleDocsTool,
+    emailReadTool,
+    emailWriteTool,
+    webSearchTool,
+    createBrowserUseTool(onEvent),
+  ];
 }
 
-function buildGraph() {
-  // Planner model — temperature 0 for consistent tool selection
-  const model = new ChatOpenAI({
+function createPlannerModel(tools) {
+  return new ChatOpenAI({
     apiKey: config.openai.apiKey,
-    model: "gpt-4o-mini",   // hard-coded to avoid gpt-3.5-turbo fallback
+    model: "gpt-4o-mini",
     temperature: 0,
-  }).bindTools(TOOLS);
+  }).bindTools(tools);
+}
 
-  // Separate summarizer model — no tools, just synthesis
-  const summarizerModel = new ChatOpenAI({
+function createSummarizerModel() {
+  return new ChatOpenAI({
     apiKey: config.openai.apiKey,
     model: "gpt-4o-mini",
     temperature: 0.3,
   });
+}
 
-  const rawToolNode = new ToolNode(TOOLS);
+function safeJsonParse(value) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
 
-  /**
-   * Safe wrapper: guarantees a ToolMessage for every tool_call_id in the last
-   * AIMessage, even when a tool throws or ToolNode itself throws.
-   * Without this, an unhandled error leaves an AIMessage with tool_calls
-   * unanswered, and OpenAI returns 400 on the next planner call.
-   */
-  async function safeToolsNode(state) {
-    const lastAI = state.messages[state.messages.length - 1];
-    const toolCalls = (lastAI instanceof AIMessage && lastAI.tool_calls) ? lastAI.tool_calls : [];
+function asToolContent(value) {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
 
-    try {
-      return await rawToolNode.invoke(state);
-    } catch (err) {
-      // ToolNode itself threw — build error ToolMessages for every pending call
-      const errorMessages = toolCalls.map(
-        (tc) =>
-          new ToolMessage({
-            content: JSON.stringify({ error: err.message, tool: tc.name }),
-            tool_call_id: tc.id,
-            name: tc.name,
-          })
-      );
-      return { messages: errorMessages };
-    }
+function hasToolError(parsed) {
+  return Boolean(parsed && typeof parsed === "object" && parsed.error);
+}
+
+function summarizeToolOutput(toolName, parsed) {
+  if (typeof parsed === "string") {
+    return parsed.length > 180 ? `${parsed.slice(0, 180)}...` : parsed;
   }
 
-  // Planner node
-  async function plannerNode(state) {
-    const calledCount = countCalledRequiredTools(state.messages);
+  if (!parsed || typeof parsed !== "object") return "Tool returned an empty response.";
 
-    // If required tools haven't been called yet, inject a reminder so the model
-    // doesn't short-circuit to summarizer before doing real research.
-    let messages = state.messages;
-    if (calledCount < REQUIRED_TOOL_NAMES.length) {
-      const remaining = REQUIRED_TOOL_NAMES.filter(
-        (t) => !state.messages.some(
-          (m) => m instanceof AIMessage && m.tool_calls?.some((tc) => tc.name === t)
-        )
-      );
-      // Append a gentle system reminder only when the model is about to give up early
-      const lastAI = [...state.messages].reverse().find((m) => m instanceof AIMessage);
-      const lastHasNoTools = lastAI && (!lastAI.tool_calls || lastAI.tool_calls.length === 0);
-      if (lastAI && lastHasNoTools && calledCount < REQUIRED_TOOL_NAMES.length) {
-        messages = [
-          ...state.messages,
-          new HumanMessage(
-            `You still need to call: ${remaining.join(", ")}. ` +
-            `Do NOT finish until all required tools have been used. Call the next required tool now.`
-          ),
-        ];
+  if (parsed.error) {
+    return `${parsed.error}: ${parsed.message || "Tool returned an error."}`;
+  }
+
+  const results = Array.isArray(parsed.results) ? parsed.results : null;
+  if (results) {
+    const label =
+      toolName === "emailRead"
+        ? "email"
+        : toolName === "googleDocs"
+          ? "document"
+          : "result";
+    return `Found ${results.length} ${label}${results.length === 1 ? "" : "s"}.`;
+  }
+
+  if (toolName === "browserUse") {
+    const screenshots = parsed.screenshots || parsed.screenshot_urls || [];
+    const summary = parsed.summary || "Browser task completed.";
+    return screenshots.length
+      ? `${summary} Captured ${screenshots.length} screenshot${screenshots.length === 1 ? "" : "s"}.`
+      : summary;
+  }
+
+  if (toolName === "emailWrite") {
+    return parsed.action === "sent"
+      ? `Email sent to ${parsed.to || "recipient"}.`
+      : `Draft created for ${parsed.to || "recipient"}.`;
+  }
+
+  if (parsed.answer) return String(parsed.answer).slice(0, 220);
+  return "Tool completed.";
+}
+
+function compactToolOutputForModel(toolName, parsed) {
+  if (typeof parsed === "string") return parsed.slice(0, 4000);
+  if (!parsed || typeof parsed !== "object") return JSON.stringify(parsed);
+
+  if (hasToolError(parsed)) {
+    return JSON.stringify({
+      error: parsed.error,
+      message: parsed.message,
+      results: parsed.results || [],
+    });
+  }
+
+  if (Array.isArray(parsed.results)) {
+    return JSON.stringify({
+      ...parsed,
+      results: parsed.results.slice(0, 5).map((item) => ({
+        ...item,
+        snippet: item.snippet ? String(item.snippet).slice(0, 900) : item.snippet,
+      })),
+    });
+  }
+
+  if (toolName === "browserUse") {
+    return JSON.stringify({
+      task: parsed.task,
+      url: parsed.url,
+      summary: parsed.summary,
+      screenshots: parsed.screenshots || parsed.screenshot_urls || [],
+      pageText: parsed.pageText ? String(parsed.pageText).slice(0, 1200) : "",
+    });
+  }
+
+  return JSON.stringify(parsed).slice(0, 4000);
+}
+
+function buildConversationForSummary(messages) {
+  return messages
+    .map((m) => {
+      if (m instanceof SystemMessage) return null;
+      if (m instanceof HumanMessage) {
+        const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+        if (content.startsWith("You still need to call:")) return null;
+        return `User request:\n${content}`;
       }
-    }
+      if (m instanceof ToolMessage) {
+        return `Tool result [${m.name}]:\n${String(m.content).slice(0, 2500)}`;
+      }
+      const toolCalls = m.tool_calls || [];
+      if (toolCalls.length > 0) {
+        return `Agent called tools: ${toolCalls.map((tc) => tc.name).join(", ")}`;
+      }
+      const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      return content ? `Agent reasoning:\n${content}` : null;
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
 
-    const response = await model.invoke(messages);
-    return { messages: [response] };
-  }
+async function synthesizeProposals(messages) {
+  const summarizerModel = createSummarizerModel();
+  const conversationText = buildConversationForSummary(messages);
 
-  /**
-   * Decide next step:
-   * - If model called tools → run them
-   * - If all required tools called OR model said RESEARCH COMPLETE → summarize
-   * - Otherwise → loop back to planner with a reminder injected above
-   */
-  function shouldContinue(state) {
-    const last = state.messages[state.messages.length - 1];
+  const summaryPrompt = `You are a synthesis assistant. Below is the full research session where an AI agent investigated a user's milestone using real tools.
 
-    // Model wants to call tools
-    if (last instanceof AIMessage && last.tool_calls && last.tool_calls.length > 0) {
-      return "tools";
-    }
-
-    // Model finished with text — check if it hit "RESEARCH COMPLETE" or called all required tools
-    const calledCount = countCalledRequiredTools(state.messages);
-    const content = typeof last?.content === "string" ? last.content : "";
-    const declaredDone = content.includes("RESEARCH COMPLETE");
-    const calledAllRequired = calledCount >= REQUIRED_TOOL_NAMES.length;
-
-    if (declaredDone || calledAllRequired) {
-      return "summarizer";
-    }
-
-    // Not done yet — loop back so plannerNode can inject a reminder
-    return "planner";
-  }
-
-  // Summarizer node: synthesize all tool results into proposals JSON
-  async function summarizerNode(state) {
-    const conversationText = state.messages
-      .map((m) => {
-        if (m instanceof SystemMessage) return null;
-        if (m instanceof HumanMessage) {
-          const c = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-          // Skip injected reminder messages from the loop
-          if (c.startsWith("You still need to call:")) return null;
-          return `User request: ${c}`;
-        }
-        if (m instanceof AIMessage) {
-          const text = m.content || "[called tools]";
-          const toolNames = m.tool_calls?.map((tc) => tc.name).join(", ");
-          return toolNames
-            ? `Agent decided to call: ${toolNames}`
-            : `Agent reasoning: ${text}`;
-        }
-        if (m instanceof ToolMessage) {
-          const raw = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-          const trimmed = raw.slice(0, 2000);
-          return `Tool result [${m.name}]:\n${trimmed}`;
-        }
-        return null;
-      })
-      .filter(Boolean)
-      .join("\n\n");
-
-    const summaryPrompt = `You are a synthesis assistant. Below is the full research session where an AI agent investigated a user's milestone using real tools (Google Docs, Gmail, web search, browser).
-
-Your job: extract 3–5 concrete, immediately actionable proposed todos based ONLY on what the tools actually found. Do NOT invent sources. Cite real doc titles, email subjects, or URLs from the tool results.
+Your job: extract 3-5 concrete, immediately actionable proposed todos based ONLY on what the tools actually found. Do NOT invent sources. Cite real doc titles, email subjects, or URLs from the tool results.
 
 Return ONLY valid JSON (no markdown fences, no extra text):
 {
@@ -178,154 +177,164 @@ Return ONLY valid JSON (no markdown fences, no extra text):
       "sources": ["exact doc/email subject/URL from tool results"]
     }
   ],
-  "summary": "2–3 sentences: what was actually found and why these proposals are the right next steps"
+  "summary": "2-3 sentences: what was actually found and why these proposals are the right next steps"
 }
 
 Research session:
 ${conversationText}`;
 
-    const response = await summarizerModel.invoke([new HumanMessage(summaryPrompt)]);
-    return { messages: [response] };
+  const response = await summarizerModel.invoke([new HumanMessage(summaryPrompt)]);
+  const raw = typeof response.content === "string" ? response.content.trim() : JSON.stringify(response.content);
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    return {
+      proposals: Array.isArray(parsed.proposals) ? parsed.proposals : [],
+      summary: parsed.summary || "",
+    };
+  } catch {
+    return { proposals: [], summary: raw.slice(0, 500) };
   }
-
-  const checkpointer = new MemorySaver();
-
-  const graph = new StateGraph(MessagesAnnotation)
-    .addNode("planner", plannerNode)
-    .addNode("tools", safeToolsNode)
-    .addNode("summarizer", summarizerNode)
-    .addEdge(START, "planner")
-    .addConditionalEdges("planner", shouldContinue, {
-      tools: "tools",
-      summarizer: "summarizer",
-      planner: "planner",
-    })
-    .addEdge("tools", "planner")
-    .addEdge("summarizer", END)
-    .compile({ checkpointer });
-
-  return graph;
 }
 
-// Singleton compiled graph
-let _graph = null;
-function getGraph() {
-  if (!_graph) _graph = buildGraph();
-  return _graph;
+async function invokeTool(toolCall, onEvent, toolsByName) {
+  const tool = toolsByName.get(toolCall.name);
+  const args = toolCall.args || {};
+
+  await onEvent("tool_call", {
+    id: toolCall.id,
+    tool: toolCall.name,
+    args,
+  });
+
+  if (!tool) {
+    const output = {
+      error: "UNKNOWN_TOOL",
+      message: `Tool "${toolCall.name}" is not registered.`,
+      results: [],
+    };
+    await onEvent("tool_result", {
+      id: toolCall.id,
+      tool: toolCall.name,
+      summary: summarizeToolOutput(toolCall.name, output),
+      output,
+    });
+    return { content: JSON.stringify(output), ok: false };
+  }
+
+  try {
+    const raw = await tool.invoke(args);
+    const parsed = safeJsonParse(raw);
+    const summary = summarizeToolOutput(toolCall.name, parsed);
+    const content = compactToolOutputForModel(toolCall.name, parsed);
+
+    await onEvent("tool_result", {
+      id: toolCall.id,
+      tool: toolCall.name,
+      summary,
+      output: parsed,
+    });
+
+    return { content, ok: !hasToolError(parsed), parsed };
+  } catch (err) {
+    const output = {
+      error: "TOOL_EXCEPTION",
+      message: err.message,
+      results: [],
+    };
+    await onEvent("tool_result", {
+      id: toolCall.id,
+      tool: toolCall.name,
+      summary: summarizeToolOutput(toolCall.name, output),
+      output,
+    });
+    return { content: JSON.stringify(output), ok: false, parsed: output };
+  }
 }
 
 /**
  * Run the research agent and stream structured trace events via onEvent callback.
  */
 export async function runResearchAgent(goal, runId, onEvent) {
-  const graph = getGraph();
+  const tools = buildTools(onEvent);
+  const toolsByName = new Map(tools.map((t) => [t.name, t]));
+  const plannerModel = createPlannerModel(tools);
+  const messages = [
+    new SystemMessage(RESEARCH_SYSTEM),
+    new HumanMessage(researchUserPrompt({ goal })),
+  ];
+  const successfulRequiredTools = new Set();
 
-  // Emit a status event immediately so the trace panel isn't blank while waiting
-  await onEvent("thought", { text: `Starting research on: "${goal.title}". Will search Google Docs, Gmail, web, and browser in sequence.` });
+  await onEvent("thought", {
+    text: `Starting research on: "${goal.title}". I will show each tool call, its parameters, and a collapsible response as the work runs.`,
+  });
 
-  const input = {
-    messages: [
-      new SystemMessage(RESEARCH_SYSTEM),
-      new HumanMessage(researchUserPrompt({ goal })),
-    ],
-  };
+  for (let step = 0; step < MAX_PLANNER_STEPS; step += 1) {
+    const remaining = REQUIRED_TOOL_NAMES.filter((name) => !successfulRequiredTools.has(name));
+    const plannerInput =
+      remaining.length > 0 && step > 0
+        ? [
+            ...messages,
+            new HumanMessage(
+              `You still need successful results from: ${remaining.join(", ")}. ` +
+                "Call the next useful required tool now. Do not finish yet."
+            ),
+          ]
+        : messages;
 
-  const streamConfig = {
-    configurable: { thread_id: String(runId) },
-    version: "v2",
-  };
+    const response = await plannerModel.invoke(plannerInput);
+    messages.push(response);
 
-  let proposals = [];
-  let summary = "";
+    const toolCalls = response.tool_calls || [];
+    const responseText = typeof response.content === "string" ? response.content.trim() : "";
 
-  // Accumulate planner text tokens into readable thought bubbles
-  let thoughtBuffer = "";
-  let lastFlushAt = Date.now();
+    if (responseText && !responseText.includes("RESEARCH COMPLETE")) {
+      await onEvent("thought", { text: responseText });
+    }
 
-  const flushThought = async () => {
-    const text = thoughtBuffer.trim();
-    if (text) await onEvent("thought", { text });
-    thoughtBuffer = "";
-  };
+    if (toolCalls.length === 0) {
+      if (remaining.length === 0 || responseText.includes("RESEARCH COMPLETE")) break;
+      continue;
+    }
 
-  // Track which tools have been called so we can emit a trace step label
-  const toolCallsEmitted = new Set();
+    for (const toolCall of toolCalls) {
+      const result = await invokeTool(toolCall, onEvent, toolsByName);
+      messages.push(
+        new ToolMessage({
+          content: asToolContent(result.content),
+          tool_call_id: toolCall.id,
+          name: toolCall.name,
+        })
+      );
 
-  for await (const event of graph.streamEvents(input, streamConfig)) {
-    const { event: evtType, name, data, metadata } = event;
-    const graphNode = metadata?.langgraph_node;
-
-    // ── Planner text tokens → accumulate into thought bubble ────────────────
-    if (evtType === "on_chat_model_stream" && graphNode === "planner") {
-      const content = data?.chunk?.content;
-      if (content && typeof content === "string") {
-        thoughtBuffer += content;
-        const now = Date.now();
-        if (
-          thoughtBuffer.length > 300 ||
-          /[.!?\n]/.test(content) ||
-          now - lastFlushAt > 1500
-        ) {
-          await flushThought();
-          lastFlushAt = now;
-        }
+      if (result.ok && REQUIRED_TOOL_NAMES.includes(toolCall.name)) {
+        successfulRequiredTools.add(toolCall.name);
       }
     }
 
-    // Flush remaining thought when planner finishes one response
-    if (evtType === "on_chat_model_end" && graphNode === "planner") {
-      await flushThought();
-
-      // If the planner response contains tool_calls but no text, emit a status thought
-      const aiMsg = data?.output;
-      const hasCalls = aiMsg?.tool_calls?.length > 0;
-      const hasText = aiMsg?.content && String(aiMsg.content).trim().length > 0;
-      if (hasCalls && !hasText) {
-        const toolNames = aiMsg.tool_calls.map((tc) => tc.name).join(", ");
-        await onEvent("thought", { text: `Calling tool${aiMsg.tool_calls.length > 1 ? "s" : ""}: ${toolNames}` });
-      }
-    }
-
-    // ── Tool invoked ──────────────────────────────────────────────────────────
-    if (evtType === "on_tool_start") {
-      await flushThought();
-      await onEvent("tool_call", {
-        tool: name,
-        args: data?.input || {},
-      });
-    }
-
-    // ── Tool returned ─────────────────────────────────────────────────────────
-    if (evtType === "on_tool_end") {
-      let output = data?.output;
-      if (typeof output === "string") {
-        try { output = JSON.parse(output); } catch { /* keep as string */ }
-      }
-      await onEvent("tool_result", {
-        tool: name,
-        output,
-      });
-    }
-
-    // ── Summarizer finished → extract proposals JSON ──────────────────────────
-    if (evtType === "on_chat_model_end" && graphNode === "summarizer") {
-      const raw = data?.output?.content ?? "";
-      const text = typeof raw === "string" ? raw.trim() : JSON.stringify(raw);
-      // Strip markdown code fences if model wraps JSON in ```json ... ```
-      const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-      try {
-        const parsed = JSON.parse(cleaned);
-        proposals = Array.isArray(parsed.proposals) ? parsed.proposals : [];
-        summary = parsed.summary || "";
-      } catch {
-        summary = text.slice(0, 500);
-      }
+    if (REQUIRED_TOOL_NAMES.every((name) => successfulRequiredTools.has(name))) {
+      await onEvent("thought", { text: "Required research tools completed. Synthesizing proposals." });
+      break;
     }
   }
 
-  if (proposals.length > 0) {
-    await onEvent("proposals", { proposals, summary });
+  // Hard-fail only if core search tools never returned results
+  const hardMissing = HARD_REQUIRED_TOOL_NAMES.filter((name) => !successfulRequiredTools.has(name));
+  if (hardMissing.length > 0) {
+    throw new Error(`Research could not complete. Missing core tool results: ${hardMissing.join(", ")}`);
   }
 
+  // Soft-warn for optional tools (googleDocs, emailRead, browserUse) — still synthesize
+  const softMissing = REQUIRED_TOOL_NAMES.filter(
+    (name) => !HARD_REQUIRED_TOOL_NAMES.includes(name) && !successfulRequiredTools.has(name)
+  );
+  if (softMissing.length > 0) {
+    await onEvent("thought", {
+      text: `Note: ${softMissing.join(", ")} did not return successful results. Generating proposals from available research data.`,
+    });
+  }
+
+  const { proposals, summary } = await synthesizeProposals(messages);
   return { proposals, summary };
 }
